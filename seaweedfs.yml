@@ -1,0 +1,146 @@
+services:
+  # Single-node SeaweedFS (master + volume + filer + S3 gateway), used as the
+  # S3 object storage backend for Seafile.
+  seaweedfs:
+    image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:4.48}
+    container_name: seafile-seaweedfs
+    restart: unless-stopped
+    command:
+      - server
+      - -ip=seaweedfs
+      - -ip.bind=0.0.0.0
+      - -master.volumeSizeLimitMB=${SEAWEEDFS_VOLUME_SIZE_LIMIT_MB:-30000}
+      - -filer
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/etc/seaweedfs/s3.json
+    volumes:
+      - ${SEAWEEDFS_VOLUME:-/opt/seaweedfs-data}:/data
+    configs:
+      - source: seaweedfs-s3
+        target: /etc/seaweedfs/s3.json
+      # Defines the AWS S3 remote tier; the master pushes it to volume servers.
+      - source: seaweedfs-master
+        target: /etc/seaweedfs/master.toml
+    # ports:
+    #   - "8333:8333" # S3 API
+    #   - "8888:8888" # filer UI
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/healthz || exit 1"]
+      interval: 10s
+      start_period: 20s
+      timeout: 5s
+      retries: 10
+    networks:
+      - seafile-net
+
+  # Creates the buckets Seafile needs (idempotent), then exits.
+  seaweedfs-init:
+    image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:4.48}
+    container_name: seafile-seaweedfs-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # s3.bucket.list prints to stderr: "  <name><TAB>size:..."
+        existing=$$(echo "s3.bucket.list" | weed shell -master=seaweedfs:9333 2>&1 | awk '{print $$1}')
+        for bucket in $$BUCKETS; do
+          if echo "$$existing" | grep -qxF -- "$$bucket"; then
+            echo "bucket $$bucket already exists"
+          else
+            echo "s3.bucket.create -name $$bucket" | weed shell -master=seaweedfs:9333
+            echo "created bucket $$bucket"
+          fi
+        done
+    environment:
+      - BUCKETS=${S3_COMMIT_BUCKET:?Variable is not set or empty} ${S3_FS_BUCKET:?Variable is not set or empty} ${S3_BLOCK_BUCKET:?Variable is not set or empty}
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    networks:
+      - seafile-net
+
+  # Admin UI (cluster topology, volumes, file browser, maintenance), served by
+  # Caddy at SEAWEEDFS_ADMIN_HOSTNAME. Workers connect to its gRPC port (23646 + 10000).
+  seaweedfs-admin:
+    image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:4.48}
+    container_name: seafile-seaweedfs-admin
+    restart: unless-stopped
+    command:
+      - admin
+      - -ip=0.0.0.0
+      - -port=23646
+      - -master=seaweedfs:9333
+      - -dataDir=/data
+      - -adminUser=${SEAWEEDFS_ADMIN_USER:-admin}
+      - -adminPassword=${SEAWEEDFS_ADMIN_PASSWORD:?Variable is not set or empty}
+    volumes:
+      - ${SEAWEEDFS_ADMIN_VOLUME:-/opt/seaweedfs-admin}:/data
+    labels:
+      caddy: ${SEAFILE_SERVER_PROTOCOL:-http}://${SEAWEEDFS_ADMIN_HOSTNAME:?Variable is not set or empty}
+      caddy.reverse_proxy: "{{upstreams 23646}}"
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    networks:
+      - seafile-net
+
+  # Maintenance worker (vacuum, balance, erasure coding, ...) driven by the admin server.
+  seaweedfs-worker:
+    image: ${SEAWEEDFS_IMAGE:-chrislusf/seaweedfs:4.48}
+    container_name: seafile-seaweedfs-worker
+    restart: unless-stopped
+    command:
+      - worker
+      - -admin=seaweedfs-admin:23646
+      - -jobType=all
+      - -workingDir=/data
+    volumes:
+      - ${SEAWEEDFS_WORKER_VOLUME:-/opt/seaweedfs-worker}:/data
+    depends_on:
+      seaweedfs-admin:
+        condition: service_started
+    networks:
+      - seafile-net
+
+  seafile:
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+
+configs:
+  seaweedfs-s3:
+    content: |
+      {
+        "identities": [
+          {
+            "name": "seafile",
+            "credentials": [
+              {
+                "accessKey": "${S3_KEY_ID:?Variable is not set or empty}",
+                "secretKey": "${S3_SECRET_KEY:?Variable is not set or empty}"
+              }
+            ],
+            "actions": ["Admin", "Read", "List", "Tagging", "Write"]
+          }
+        ]
+      }
+
+  # Remote tier for `volume.tier.upload -dest=s3.default`: moves a volume's .dat
+  # file to AWS S3 while its .idx stays local. Run by the worker's admin_script job.
+  seaweedfs-master:
+    content: |
+      [storage.backend]
+      [storage.backend.s3.default]
+      enabled = ${SEAWEEDFS_TIER_S3_ENABLED:-false}
+      aws_access_key_id = "${SEAWEEDFS_TIER_S3_KEY_ID:-}"
+      aws_secret_access_key = "${SEAWEEDFS_TIER_S3_SECRET_KEY:-}"
+      region = "${SEAWEEDFS_TIER_S3_REGION:-us-east-1}"
+      bucket = "${SEAWEEDFS_TIER_S3_BUCKET:-}"
+      endpoint = "${SEAWEEDFS_TIER_S3_ENDPOINT:-}"
+      storage_class = "${SEAWEEDFS_TIER_S3_STORAGE_CLASS:-STANDARD_IA}"
+
+networks:
+  seafile-net:
+    name: seafile-net
